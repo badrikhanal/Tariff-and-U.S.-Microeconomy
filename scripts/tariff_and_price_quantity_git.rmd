@@ -1,0 +1,1016 @@
+---
+title: "Tariff and price"
+author: "Badri Khanal"
+date: "2025-09-17"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+
+# Required packages
+#install.packages(c("httr","jsonlite","tidyverse","lubridate","scales","fredr"))
+
+library(httr); 
+library(jsonlite); 
+library(tidyverse); 
+library(lubridate); 
+library(scales); 
+library(fredr)
+```
+
+```{r}
+
+# ---------- USER: set API KEYS ----------
+
+CENSUS_KEY <- # use personal census key  # Census key
+fredr_set_key (" # Use FRED key")  
+
+# ---------- PARAMETERS ----------
+hs6 <- "720839"                # HS6 heading for hot-rolled steel (720839)
+hs4 <- "7208"                 # HS6 heading for flat-rolled steeel (7208)
+
+# ---------- 1) Pull Census monthly import data (general imports) ----------
+# Query variables: GEN_VAL_MO (general imports total value monthly), GEN_QY1_MO (general imports qty1 monthly), MONTH
+
+library(httr)
+
+
+base <- "https://api.census.gov/data/timeseries/intltrade/imports/hs"
+vars <- "GEN_VAL_MO,CON_QY1_MO,MONTH,COMM_LVL,I_COMMODITY"
+
+
+
+
+
+# ---------- PARAMETERS ----------
+hs4 <- "7208"                        # HS4 code for flat-rolled steel
+start_ym <- "2018-01"                # start month
+end_ym <- "2025-11"# latest month
+library(lubridate)
+months <- seq(ymd(paste0(start_ym,"-01")), ymd(paste0(end_ym,"-01")), by = "months")
+months_str <- format(months, "%Y-%m")
+
+
+
+
+ # Create a list of all months from 2018 to 2025
+months_2018_2025 <- format(seq(as.Date("2018-01-01"), as.Date("2025-11-01"), by = "month"), "%Y-%m")
+
+ # Initialize an empty list to store the data
+all_data <- list()
+
+
+   # Loop through each month and make an API request
+   for (month in months_2018_2025) {
+       qs <- list(
+           get = vars,
+           COMM_LVL = "HS4",
+           I_COMMODITY = "7208", 
+           time = month,
+           key = CENSUS_KEY
+        )
+      req_url <- modify_url(base, query = qs)
+       res <- GET(req_url)
+       stop_for_status(res)
+       dat <- content(res, as = "parsed")
+       
+   # Extract the data rows, skipping the header row
+         if (length(dat) > 1) {
+             data_rows <- dat[-1]
+             all_data[[month]] <- data_rows
+           }
+     }
+
+   # Combine all data into a single data frame
+   combined_data <- do.call(rbind, all_data)
+   
+   str(combined_data)
+   
+ 
+ # combined_data is a list of lists, each inner list has 8 elements
+ # Define column names
+ col_names <- c("GeneralValue", "ConsumptionQuantity", "MonthNum", "CommodityLevel",
+                "CommodityID", "SourceCommodityLevel", "SourceCommodityID", "Time")
+ 
+ # Convert each inner list to a data.frame row
+ df_list <- lapply(combined_data, function(x) {
+   as.data.frame(t(unlist(x)), stringsAsFactors = FALSE)  # transpose to make a row
+ })
+ 
+ # Combine all rows into one data.frame
+ result_df <- do.call(rbind, df_list)
+ 
+ # Set column names
+ colnames(result_df) <- col_names
+ 
+ # Convert numeric columns
+ result_df <- result_df %>%
+   mutate(
+     GeneralValue = as.numeric(GeneralValue),
+     ConsumptionQuantity = as.numeric(ConsumptionQuantity)
+   )
+ 
+ # View
+ head(result_df)
+ tail(result_df)
+
+
+
+# ---------- 2) Clean and transform ----------
+
+ 
+library(dplyr)
+library(lubridate)
+
+dat <- result_df %>%
+  mutate(
+    # Convert "YYYY-MM" to "YYYY-MM-01" and then to Date
+    MONTH = ymd(paste0(Time, "-01")),
+    import_value = as.numeric(GeneralValue),
+    import_qty1 = as.numeric(ConsumptionQuantity),
+    unit_value = ifelse(import_qty1 > 0, import_value / import_qty1, NA)
+  ) %>%
+  select(MONTH, import_value, import_qty1, unit_value) %>%
+  arrange(MONTH)
+
+head(dat)
+
+
+
+```
+
+#====PPI of Steel Mill Products ===#
+```{r}
+
+
+
+# ---------- 2) Get domestic PPI from FRED ----------
+ppi_fred_id <- "WPU1017"   # Steel Mill Products (commodity) on FRED
+ppi <- fredr(series_id = ppi_fred_id,
+             observation_start = ym(paste0(start_ym)),
+             observation_end   = Sys.Date()) %>%
+  transmute(MONTH = as_date(date), ppi = value)
+
+# ---------- 3) Merge and index to Jan 2017 = 100 ----------
+start_base <- ymd(paste0(start_ym, "-01"))
+# compute index base values
+unit_base <- dat %>% filter(MONTH == start_base) %>% pull(unit_value) %>% mean(na.rm = TRUE)
+ppibase   <- ppi %>% filter(MONTH == start_base) %>% pull(ppi) 
+
+dat2 <- dat %>%
+  left_join(ppi, by = "MONTH") %>%
+  mutate(unit_index = (unit_value / unit_base) * 100,
+         ppi_index  = (ppi / ppibase) * 100,
+         import_value_m = import_value / 1e6)  # millions USD
+
+# ---------- 4) Add tariff event lines  ----------
+tariff_events <- tibble(
+  event = c("Section 232 (25% effective)", "Recent Tariff (25% effective)"),
+  date  = as.Date(c("2018-03-23","2025-03-12"))  
+)
+
+```
+
+```{r}
+
+# ---------- 5) Plot ----------
+
+library(ggplot2)
+library(ggplot2)
+library(scales)
+
+# Rescale PPI index to fit import_value range
+ppi_scaled <- scales::rescale(dat2$ppi_index,
+                              to = c(0, max(dat2$import_value, na.rm = TRUE)),
+                              from = c(min(dat2$ppi_index, na.rm = TRUE),
+                                       max(dat2$ppi_index, na.rm = TRUE)))
+
+dat2$ppi_scaled <- ppi_scaled
+
+max_import <- max(dat2$import_value, na.rm = TRUE)
+max_ppi    <- max(dat2$ppi_index, na.rm = TRUE)
+
+# Plot
+library(scales)
+
+p <- ggplot(dat2, aes(x = MONTH)) +
+  
+  # Bars for import value
+  geom_col(aes(y = import_value), fill = "grey80", width = 25) +
+  
+  # PPI index line (already rescaled)
+  geom_line(aes(y = ppi_scaled), color = "blue", size = 1.2, linetype = "dashed") +
+  
+  # Tariff events
+  geom_vline(data = tariff_events, aes(xintercept = as.numeric(date)),
+             color = "red", linetype = "dotted",size=1) +
+  geom_text(data = tariff_events, 
+            aes(x = date, y = 0, label = event),
+            angle = 90, vjust = 1.2, hjust = 0, size = 3, color = "red") +
+
+  
+  # Primary & secondary y-axes
+  scale_y_continuous(
+    name = "Monthly import value (USD millions)",
+    labels = label_number(scale = 1e-6, suffix = "M"),   # <-- format in millions
+    breaks = seq(0, max_import, by = 80e6),    # 0, 50, 100, 150... million
+    sec.axis = sec_axis(
+      trans = ~ scales::rescale(., 
+                                to = c(min(dat2$ppi_index, na.rm = TRUE),
+                                       max(dat2$ppi_index, na.rm = TRUE)),
+                                from = c(0, max(dat2$import_value, na.rm = TRUE))),
+      name = "PPI Index (Jan 2018 = 100)",
+      breaks = seq(0, ceiling(max_ppi/50)*50, by = 20)  # 0, 50, 100...
+    )
+  ) +
+  
+  scale_x_date(date_breaks = "3 months", date_labels = "%b\n%Y", limits = c(as.Date("2018-01-01"), max(dat2$MONTH, na.rm = TRUE)),expand = c(0, 0))    +
+  
+  labs(
+  title = "U.S. Monthly Imports: Flat-rolled steel (HS7208)",
+  subtitle = paste0(
+    format(as.Date("2018-01-01"), "%b %Y"),  # start
+    " → ",
+    format(max(dat2$MONTH, na.rm = TRUE), "%b %Y")  # end
+  ),
+  x = "Month and Year"
+) +
+  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p
+
+
+
+# Save plot
+ggsave("steel_flatrolled_tariff_plot.png", p, width = 12, height = 6, dpi = 300)
+print(p)
+
+
+
+
+
+```
+
+
+#=============IPI of Still Mill Product====== #
+#========= Industrial price index only availabe for 2025 ===#
+
+```{r}
+
+
+# ---------- 2) Get domestic CPI from FRED ----------
+
+Ipi_fred_id <- "IP72"   # 
+Ipi <- fredr(series_id = Ipi_fred_id,
+             observation_start = ym(paste0(start_ym)),
+             observation_end   = Sys.Date()) %>%
+  transmute(MONTH = as_date(date), Ipi = value)
+head(Ipi,60)
+print(Ipi)
+
+# ---------- 3) Merge and index to Jan 2017 = 100 ----------
+start_base <- ymd(paste0(start_ym, "-01"))
+# compute index base values
+unit_base <- dat %>% filter(MONTH == start_base) %>% pull(unit_value) %>% mean(na.rm = TRUE)
+base   <- Ipi %>% filter(MONTH == start_base) %>% pull(Ipi) 
+
+dat2_Ipi <- dat %>%
+  left_join(Ipi, by = "MONTH") %>%
+  mutate(unit_index = (unit_value / unit_base) * 100,
+         Ipi_index  = (Ipi / ppibase) * 100,
+         import_value_m = import_value / 1e6)  # millions USD
+
+# ---------- 4) Add tariff event lines --------
+tariff_events <- tibble(
+  event = c("Section 232 (25% effective)", "Recent Tariff (25% effective)"),
+  date  = as.Date(c("2018-03-23","2025-03-12")) 
+)
+
+# ---------- 5) Plot ----------
+
+library(ggplot2)
+library(ggplot2)
+library(scales)
+
+# 1. Compute linear scaling for IPI to match import_value range
+min_import <- min(dat2_Ipi$import_value, na.rm = TRUE)
+max_import <- max(dat2_Ipi$import_value, na.rm = TRUE)
+min_ppi <- min(dat2_Ipi$Ipi_index, na.rm = TRUE)
+max_ppi <- max(dat2_Ipi$Ipi_index, na.rm = TRUE)
+
+dat2_Ipi <- dat2_Ipi %>%
+  mutate(
+    Ipi_scaled_a = (Ipi_index - min_Ipi) / (max_Ipi - min_Ipi) * (max_import - min_import) + min_import
+  )
+
+
+max_import_Ipi <- max(dat2_a$import_value, na.rm = TRUE)
+max_ppi_Ipi   <- max(dat2_a$Ipi_index, na.rm = TRUE)
+
+# Rescale PPI index to fit import_value range
+Ipi_scaled <- scales::rescale(dat2_Ipi$Ipi_index,
+                              to = c(0, max(dat2_Ipi$import_value, na.rm = TRUE)),
+                              from = c(min(dat2_Ipi$Ipi_index, na.rm = TRUE),
+                                       max(dat2_Ipi$Ipi_index, na.rm = TRUE)))
+
+dat2$Ipi_scaled <- Ipi_scaled
+
+max_import <- max(dat2_Ipi$import_value, na.rm = TRUE)
+max_Ipi    <- max(dat2_Ipi$Ipi_index, na.rm = TRUE)
+
+# Plot
+library(scales)
+
+Ip <- ggplot(dat2_Ipi, aes(x = MONTH)) +
+  
+  # Bars for import value
+  geom_col(aes(y = import_value), fill = "grey80", width = 25) +
+  
+  # PPI index line (already rescaled)
+  geom_line(aes(y = Ipi_scaled), color = "blue", size = 1.2, linetype = "dashed") +
+  
+  # Tariff events
+  geom_vline(data = tariff_events, aes(xintercept = as.numeric(date)),
+             color = "red", linetype = "dotted",size=1) +
+  geom_text(data = tariff_events, 
+            aes(x = date, y = 0, label = event),
+            angle = 90, vjust = 1.2, hjust = 0, size = 3, color = "red") +
+
+  
+  # Primary & secondary y-axes
+  scale_y_continuous(
+    name = "Monthly import value (USD millions)",
+    labels = label_number(scale = 1e-6, suffix = "M"),   # <-- format in millions
+    breaks = seq(0, max_import, by = 80e6),    # 0, 50, 100, 150... million
+    sec.axis = sec_axis(
+      trans = ~ scales::rescale(., 
+                                to = c(min(dat2_Ipi$Ipi_index, na.rm = TRUE),
+                                       max(dat2_Ipi$Ipi_index, na.rm = TRUE)),
+                                from = c(0, max(dat2_Ipi$import_value, na.rm = TRUE))),
+      name = "IPI Index (Jan 2018 = 100)",
+      breaks = seq(0, ceiling(max_Ipi/50)*5, by = 20)  # 0, 50, 100...
+    )
+  ) +
+  
+  scale_x_date(date_breaks = "3 months", date_labels = "%b\n%Y", limits = c(as.Date("2018-01-01"), max(dat2$MONTH, na.rm = TRUE)),expand = c(0, 0))    +
+  
+  labs(
+  title = "U.S. Monthly Imports: Flat-rolled steel (HS7208)",
+  subtitle = paste0(
+    format(as.Date("2018-01-01"), "%b %Y"),  # start
+    " → ",
+    format(max(dat2$MONTH, na.rm = TRUE), "%b %Y")  # end
+  ),
+  x = "Month and Year"
+) +
+  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+Ip
+
+
+
+# Save plot
+ggsave("steel_flatrolled_tariff_plot_withIPI.png", Ip, width = 12, height = 6, dpi = 300)
+print(Ip)
+
+```
+
+
+#---------- Alumiunum
+#===
+
+```{r}
+ 
+library(httr)
+library(dplyr)
+library(lubridate)
+
+CENSUS_KEY <- # use personal census key  # Census key
+fredr_set_key (" # Use FRED key")  
+
+base <- "https://api.census.gov/data/timeseries/intltrade/imports/hs"
+vars <- "GEN_VAL_MO,CON_QY1_MO,MONTH,COMM_LVL,I_COMMODITY"
+
+# Parameters
+hs4 <- "7606"   # Aluminum plates, sheets, strip >0.2 mm
+start_ym <- "2018-01"
+end_ym   <- "2025-08"
+
+# Generate months
+months_seq <- format(seq(ymd(paste0(start_ym, "-01")),
+                         ymd(paste0(end_ym, "-01")),
+                         by = "month"), "%Y-%m")
+
+# Empty list
+all_data_a <- list()
+
+# Loop through months
+for (month in months_seq) {
+  qs <- list(
+    get = vars,
+    COMM_LVL = "HS4",
+    I_COMMODITY = hs4,
+    time = month,
+    key = CENSUS_KEY
+  )
+  
+  req_url <- modify_url(base, query = qs)
+  res <- GET(req_url)
+  stop_for_status(res)
+  dat <- content(res, as = "parsed")
+  
+  if (length(dat) > 1) {
+    data_rows <- dat[-1]  # drop header row
+    all_data_a[[month]] <- data_rows
+  }
+}
+
+# Combine
+combined_data_a <- do.call(rbind, all_data_a)
+
+# Column names
+col_names_a <- c("GeneralValue", "ConsumptionQuantity", "MonthNum",
+                 "CommodityLevel", "CommodityID",
+                 "SourceCommodityLevel", "SourceCommodityID", "Time")
+
+# Convert list -> dataframe
+df_list_a <- lapply(combined_data_a, function(x) {
+  as.data.frame(t(unlist(x)), stringsAsFactors = FALSE)
+})
+
+result_df_a <- do.call(rbind, df_list_a)
+colnames(result_df_a) <- col_names_a
+
+# Convert numeric
+result_df_a <- result_df_a %>%
+  mutate(
+    GeneralValue = as.numeric(GeneralValue),
+    ConsumptionQuantity = as.numeric(ConsumptionQuantity)
+  )
+
+head(result_df_a)
+
+
+
+# ---------- 2) Clean and transform ----------
+
+ 
+library(dplyr)
+library(lubridate)
+
+dat_a <- result_df_a %>%
+  mutate(
+    # Convert "YYYY-MM" to "YYYY-MM-01" and then to Date
+    MONTH = ymd(paste0(Time, "-01")),
+    import_value = as.numeric(GeneralValue),
+    import_qty1 = as.numeric(ConsumptionQuantity),
+    unit_value = ifelse(import_qty1 > 0, import_value / import_qty1, NA)
+  ) %>%
+  select(MONTH, import_value, import_qty1, unit_value) %>%
+  arrange(MONTH)
+
+head(dat_a)
+
+
+
+```
+
+
+```{r}
+
+
+
+# ---------- 2) Get domestic PPI from FRED ----------
+## PPI = WPU10250162 ( Producer price index by commodity Metals and Metal Products: Extruded Alumiunm Shapes (rod, bar, wire))
+ppi_fred_id_a <- "WPU10250162"   #  on FRED
+ppi_a <- fredr(series_id = ppi_fred_id_a,
+             observation_start = ym(paste0(start_ym)),
+             observation_end   = Sys.Date()) %>%
+  transmute(MONTH = as_date(date), ppi_a = value)
+
+# ---------- 3) Merge and index to Jan 2018 = 100 ----------
+start_base <- ymd(paste0(start_ym, "-01"))
+# compute index base values
+unit_base <- dat_a %>% filter(MONTH == start_base) %>% pull(unit_value) %>% mean(na.rm = TRUE)
+ppibase   <- ppi_a %>% filter(MONTH == start_base) %>% pull(ppi_a) 
+
+dat2_a <- dat_a %>%
+  left_join(ppi_a, by = "MONTH") %>%
+  mutate(unit_index = (unit_value / unit_base) * 100,
+         ppi_index  = (ppi_a / ppibase) * 100,
+         import_value_m = import_value / 1e6)  # millions USD
+
+# ---------- 4) Add tariff event lines (manual edit needed) ----------
+tariff_events_a <- tibble(
+  event = c("Section 232 (10% effective)", "March Tariff (25% effective)", "June Tariff (50% effective)"),
+  date  = as.Date(c("2018-03-23","2025-03-12", "2025-06-04"))  
+)
+
+```
+
+```{r}
+
+# ---------- 5) Plot ----------
+
+library(ggplot2)
+library(ggplot2)
+library(scales)
+
+# Rescale PPI index to fit import_value range
+ppi_scaled_a <- scales::rescale(dat2_a$ppi_index,
+                              to = c(0, max(dat2$import_value, na.rm = TRUE)),
+                              from = c(min(dat2$ppi_index, na.rm = TRUE),
+                                       max(dat2$ppi_index, na.rm = TRUE)))
+
+dat2_a$ppi_scaled_a <- ppi_scaled_a
+
+max_import_a <- max(dat2_a$import_value, na.rm = TRUE)
+max_ppi_a    <- max(dat2_a$ppi_index, na.rm = TRUE)
+
+# Plot
+library(scales)
+
+Aluminum <- ggplot(dat2_a, aes(x = MONTH)) +
+  
+  # Bars for import value
+  geom_col(aes(y = import_value), fill = "grey80", width = 25) +
+  
+  # PPI index line (already rescaled)
+  geom_line(aes(y = ppi_scaled_a), color = "blue", size = 1.2, linetype = "dashed") +
+  
+  # Tariff events
+  geom_vline(data = tariff_events_a, aes(xintercept = as.numeric(date)),
+             color = "red", linetype = "dotted",size=1) +
+  geom_text(data = tariff_events_a, 
+            aes(x = date, y = 0, label = event),
+            angle = 90, vjust = 1.2, hjust = 0, size = 3, color = "red") +
+
+  
+  # Primary & secondary y-axes
+  scale_y_continuous(
+    name = "Monthly import value (USD millions)",
+    labels = label_number(scale = 1e-6, suffix = "M"),   # <-- format in millions
+    breaks = seq(0, max_import, by = 80e6),    # 0, 50, 100, 150... million
+    sec.axis = sec_axis(
+      trans = ~ scales::rescale(., 
+                                to = c(min(dat2_a$ppi_index_a, na.rm = TRUE),
+                                       max(dat2_a$ppi_index_a, na.rm = TRUE)),
+                                from = c(0, max(dat2_a$import_value_a, na.rm = TRUE))),
+      name = "PPI Index (Jan 2018 = 100)",
+      breaks = seq(0, ceiling(max_ppi/50)*50, by = 20)  # 0, 50, 100...
+    )
+  ) +
+  
+  scale_x_date(date_breaks = "3 months", date_labels = "%b\n%Y", limits = c(as.Date("2018-01-01"), max(dat2$MONTH, na.rm = TRUE)),expand = c(0, 0))    +
+  
+  labs(
+  title = "U.S. Monthly Imports: Aluminum plates, sheets and strips (HS7606)",
+  subtitle = paste0(
+    format(as.Date("2018-01-01"), "%b %Y"),  # start
+    " → ",
+    format(max(dat2$MONTH, na.rm = TRUE), "%b %Y")  # end
+  ),
+  x = "Month and Year"
+) +
+  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+Aluminum
+
+
+
+# Save plot
+ggsave("Aluminum_tariff_plot.png", p, width = 12, height = 6, dpi = 300)
+print(Aluminum)
+
+
+
+```
+#===========  Polysilicon===#
+
+
+```{r}
+ 
+library(httr)
+library(dplyr)
+library(lubridate)
+
+CENSUS_KEY <- # use personal census key  # Census key
+fredr_set_key (" # Use FRED key")  
+
+base <- "https://api.census.gov/data/timeseries/intltrade/imports/hs"
+vars <- "GEN_VAL_MO,CON_QY1_MO,MONTH,COMM_LVL,I_COMMODITY"
+
+# Parameters
+hs6 <- "280461"   # Poly silicon (ultra-pure silicon, >- 99.99%)
+start_ym <- "2018-01"
+end_ym   <- "2025-08"
+
+# Generate months
+months_seq <- format(seq(ymd(paste0(start_ym, "-01")),
+                         ymd(paste0(end_ym, "-01")),
+                         by = "month"), "%Y-%m")
+
+# Empty list
+all_data_a <- list()
+
+# Loop through months
+for (month in months_seq) {
+  qs <- list(
+    get = vars,
+    COMM_LVL = "HS6",
+    I_COMMODITY = hs6,
+    time = month,
+    key = CENSUS_KEY
+  )
+  
+  req_url <- modify_url(base, query = qs)
+  res <- GET(req_url)
+  stop_for_status(res)
+  dat <- content(res, as = "parsed")
+  
+  if (length(dat) > 1) {
+    data_rows <- dat[-1]  # drop header row
+    all_data_a[[month]] <- data_rows
+  }
+}
+
+# Combine
+combined_data_a <- do.call(rbind, all_data_a)
+
+# Column names
+col_names_a <- c("GeneralValue", "ConsumptionQuantity", "MonthNum",
+                 "CommodityLevel", "CommodityID",
+                 "SourceCommodityLevel", "SourceCommodityID", "Time")
+
+# Convert list -> dataframe
+df_list_a <- lapply(combined_data_a, function(x) {
+  as.data.frame(t(unlist(x)), stringsAsFactors = FALSE)
+})
+
+result_df_a <- do.call(rbind, df_list_a)
+colnames(result_df_a) <- col_names_a
+
+# Convert numeric
+result_df_a <- result_df_a %>%
+  mutate(
+    GeneralValue = as.numeric(GeneralValue),
+    ConsumptionQuantity = as.numeric(ConsumptionQuantity)
+  )
+
+head(result_df_a)
+
+
+
+# ---------- 2) Clean and transform ----------
+
+ 
+library(dplyr)
+library(lubridate)
+
+dat_a <- result_df_a %>%
+  mutate(
+    # Convert "YYYY-MM" to "YYYY-MM-01" and then to Date
+    MONTH = ymd(paste0(Time, "-01")),
+    import_value = as.numeric(GeneralValue),
+    import_qty1 = as.numeric(ConsumptionQuantity),
+    unit_value = ifelse(import_qty1 > 0, import_value / import_qty1, NA)
+  ) %>%
+  select(MONTH, import_value, import_qty1, unit_value) %>%
+  arrange(MONTH)
+
+head(dat_a)
+
+
+
+```
+
+
+```{r}
+
+
+#  2) Get domestic PPI from FRED ----------
+# Common PPI series for Industry level PPI for 
+# PPI by industry: Semi conductor 
+
+ppi_fred_id_a <- "PCU334413334413"   #  on FRED
+ppi_a <- fredr(series_id = ppi_fred_id_a,
+             observation_start = ym(paste0(start_ym)),
+             observation_end   = Sys.Date()) %>%
+  transmute(MONTH = as_date(date), ppi_a = value)
+
+# ---------- 3) Merge and index to Jan 2018 = 100 ----------
+start_base <- ymd(paste0(start_ym, "-01"))
+# compute index base values
+unit_base <- dat_a %>% filter(MONTH == start_base) %>% pull(unit_value) %>% mean(na.rm = TRUE)
+ppibase   <- ppi_a %>% filter(MONTH == start_base) %>% pull(ppi_a) 
+
+dat2_a <- dat_a %>%
+  left_join(ppi_a, by = "MONTH") %>%
+  mutate(unit_index = (unit_value / unit_base) * 100,
+         ppi_index  = (ppi_a / ppibase) * 100,
+         import_value_m = import_value / 1e6)  # millions USD
+
+# ---------- 4) Add tariff event lines (manual edit needed) ----------
+tariff_events_a <- tibble(
+  event = c("Jan Tariff China (50% effective)", "Feb Tariff China (60% effective)"),
+  date  = as.Date(c("2025-01-01", "2025-02-04")) 
+)
+
+
+
+library(ggplot2)
+library(ggplot2)
+library(scales)
+
+# 1. Compute linear scaling for PPI to match import_value range
+min_import <- min(dat2_a$import_value, na.rm = TRUE)
+max_import <- max(dat2_a$import_value, na.rm = TRUE)
+min_ppi <- min(dat2_a$ppi_index, na.rm = TRUE)
+max_ppi <- max(dat2_a$ppi_index, na.rm = TRUE)
+
+dat2_a <- dat2_a %>%
+  mutate(
+    ppi_scaled_a = (ppi_index - min_ppi) / (max_ppi - min_ppi) * (max_import - min_import) + min_import
+  )
+
+
+max_import_a <- max(dat2_a$import_value, na.rm = TRUE)
+max_ppi_a    <- max(dat2_a$ppi_index, na.rm = TRUE)
+
+# Plot
+library(scales)
+
+Polysilicon <- ggplot(dat2_a, aes(x = MONTH)) +
+  
+  # Bars for import value
+  geom_col(aes(y = import_value), fill = "grey80", width = 25) +
+  
+  # PPI index line (already rescaled)
+  geom_line(aes(y = ppi_scaled_a), color = "blue", size = 1.2, linetype = "dashed") +
+  
+  # Tariff events
+  geom_vline(data = tariff_events_a, aes(xintercept = as.numeric(date)),
+             color = "red", linetype = "dotted",size=1) +
+  geom_text(data = tariff_events_a, 
+            aes(x = date, y = 0, label = event),
+            angle = 90, vjust = 1.2, hjust = 0, size = 3, color = "red") +
+
+  
+  # Primary & secondary y-axes
+  scale_y_continuous(
+    name = "Monthly import value (USD millions)",
+    labels = label_number(scale = 1e-6, suffix = "M"),   # <-- format in millions
+    breaks = seq(0, max_import, by = 4e6),    # 0, 50, 100, 150... million
+    sec.axis = sec_axis(
+      trans = ~ scales::rescale(., 
+                                to = c(min(dat2_a$ppi_index_a, na.rm = TRUE),
+                                       max(dat2_a$ppi_index_a, na.rm = TRUE)),
+                                from = c(0, max(dat2_a$import_value_a, na.rm = TRUE))),
+      name = "PPI Index (Jan 2018 = 100)",
+      breaks = seq(0, ceiling(max_ppi/50)*50, by = 10)  # 0, 50, 100...
+    )
+  ) +
+  
+  scale_x_date(date_breaks = "3 months", date_labels = "%b\n%Y", limits = c(as.Date("2018-01-01"), max(dat2$MONTH, na.rm = TRUE)),expand = c(0, 0))    +
+  
+  labs(
+  title = "U.S. Monthly Imports: Polysilicon (HS280461) and PPI Index of Semiconductor (PCU334413334413)",
+  subtitle = paste0(
+    format(as.Date("2018-01-01"), "%b %Y"),  # start
+    " → ",
+    format(max(dat2$MONTH, na.rm = TRUE), "%b %Y")  # end
+  ),
+  x = "Month and Year"
+) +
+  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+Polysilicon
+
+
+
+# Save plot
+ggsave("Polysilicon_tariff_plot.png", p, width = 12, height = 6, dpi = 300)
+print(Polysilicon)
+
+
+```
+
+
+#=== Coffee Price Model ===#
+
+#==============#
+
+```{r}
+library(httr)
+library(dplyr)
+library(lubridate)
+
+CENSUS_KEY <- # use personal census key  # Census key
+fredr_set_key (" # Use FRED key")  
+
+base <- "https://api.census.gov/data/timeseries/intltrade/imports/hs"
+vars <- "GEN_VAL_MO,CON_QY1_MO,MONTH,COMM_LVL,I_COMMODITY"
+
+# Parameters
+hs4 <- "0901"   # Coffee)
+start_ym <- "2018-01"
+end_ym   <- "2025-08"
+
+# Generate months
+months_seq <- format(seq(ymd(paste0(start_ym, "-01")),
+                         ymd(paste0(end_ym, "-01")),
+                         by = "month"), "%Y-%m")
+
+# Empty list
+all_data_a <- list()
+
+# Loop through months
+for (month in months_seq) {
+  qs <- list(
+    get = vars,
+    COMM_LVL = "HS4",
+    I_COMMODITY = hs4,
+    time = month,
+    key = CENSUS_KEY
+  )
+  
+  req_url <- modify_url(base, query = qs)
+  res <- GET(req_url)
+  stop_for_status(res)
+  dat <- content(res, as = "parsed")
+  
+  if (length(dat) > 1) {
+    data_rows <- dat[-1]  # drop header row
+    all_data_a[[month]] <- data_rows
+  }
+}
+
+# Combine
+combined_data_a <- do.call(rbind, all_data_a)
+
+# Column names
+col_names_a <- c("GeneralValue", "ConsumptionQuantity", "MonthNum",
+                 "CommodityLevel", "CommodityID",
+                 "SourceCommodityLevel", "SourceCommodityID", "Time")
+
+# Convert list -> dataframe
+df_list_a <- lapply(combined_data_a, function(x) {
+  as.data.frame(t(unlist(x)), stringsAsFactors = FALSE)
+})
+
+result_df_a <- do.call(rbind, df_list_a)
+colnames(result_df_a) <- col_names_a
+
+# Convert numeric
+result_df_a <- result_df_a %>%
+  mutate(
+    GeneralValue = as.numeric(GeneralValue),
+    ConsumptionQuantity = as.numeric(ConsumptionQuantity)
+  )
+
+head(result_df_a)
+
+
+
+# ---------- 2) Clean and transform ----------
+
+ 
+library(dplyr)
+library(lubridate)
+
+dat_a <- result_df_a %>%
+  mutate(
+    # Convert "YYYY-MM" to "YYYY-MM-01" and then to Date
+    MONTH = ymd(paste0(Time, "-01")),
+    import_value = as.numeric(GeneralValue),
+    import_qty1 = as.numeric(ConsumptionQuantity),
+    unit_value = ifelse(import_qty1 > 0, import_value / import_qty1, NA)
+  ) %>%
+  select(MONTH, import_value, import_qty1, unit_value) %>%
+  arrange(MONTH)
+
+head(dat_a)
+
+#  2) Get domestic PPI from FRED ----------
+# Common PPI series for Industry level PPI for 
+# PPI by industry: Semi conductor 
+
+ppi_fred_id_a <- "CUSR0000SEFP01"   #  on FRED
+ppi_a <- fredr(series_id = ppi_fred_id_a,
+             observation_start = ym(paste0(start_ym)),
+             observation_end   = Sys.Date()) %>%
+  transmute(MONTH = as_date(date), ppi_a = value)
+
+# ---------- 3) Merge and index to Jan 2018 = 100 ----------
+start_base <- ymd(paste0(start_ym, "-01"))
+# compute index base values
+unit_base <- dat_a %>% filter(MONTH == start_base) %>% pull(unit_value) %>% mean(na.rm = TRUE)
+ppibase   <- ppi_a %>% filter(MONTH == start_base) %>% pull(ppi_a) 
+
+dat2_a <- dat_a %>%
+  left_join(ppi_a, by = "MONTH") %>%
+  mutate(unit_index = (unit_value / unit_base) * 100,
+         ppi_index  = (ppi_a / ppibase) * 100,
+         import_value_m = import_value / 1e6)  # millions USD
+
+# ---------- 4) Add tariff event lines (manual edit needed) ----------
+tariff_events_a <- tibble(
+  event = c("Baseline Tariff (10% effective)", "Brazil Tariff (50% effective)"),
+  date  = as.Date(c("2025-04-05", "2025-08-07"))  
+)
+
+
+
+library(ggplot2)
+library(ggplot2)
+library(scales)
+
+# 1. Compute linear scaling for PPI to match import_value range
+min_import <- min(dat2_a$import_value, na.rm = TRUE)
+max_import <- max(dat2_a$import_value, na.rm = TRUE)
+min_ppi <- min(dat2_a$ppi_index, na.rm = TRUE)
+max_ppi <- max(dat2_a$ppi_index, na.rm = TRUE)
+
+dat2_a <- dat2_a %>%
+  mutate(
+    ppi_scaled_a = (ppi_index - min_ppi) / (max_ppi - min_ppi) * 
+                   (max_import - min_import) + min_import
+  )
+
+max_import_a <- max(dat2_a$import_value, na.rm = TRUE)
+max_ppi_a    <- max(dat2_a$ppi_index, na.rm = TRUE)
+
+# Plot
+library(scales)
+
+coffee <- ggplot(dat2_a, aes(x = MONTH)) +
+  
+  # Bars for import value
+  geom_col(aes(y = import_value), fill = "grey80", width = 25) +
+  
+  # CPI line (already rescaled)
+  geom_line(aes(y = ppi_scaled_a), color = "blue", size = 1.2, linetype = "dashed") +
+  
+  # Tariff events
+  geom_vline(data = tariff_events_a, aes(xintercept = as.numeric(date)),
+             color = "red", linetype = "dotted", size=1) +
+  geom_text(data = tariff_events_a, 
+            aes(x = date, y = 0, label = event),
+            angle = 90, vjust = 1.2, hjust = 0, size = 3, color = "red") +
+  
+  # Primary & secondary y-axes
+  scale_y_continuous(
+    name = "Monthly import value (USD millions)",
+    labels = label_number(scale = 1e-6, suffix = "M"),   # format in millions
+    breaks = seq(0, max_import_a, by = 100e6),
+    sec.axis = sec_axis(
+      trans = ~ (.-min_import) / (max_import - min_import) * 
+               (max_ppi - min_ppi) + min_ppi,
+      name = "Coffee CPI Index (Jan 2018 = 100)",
+      breaks = seq(floor(min_ppi/10)*10, ceiling(max_ppi_a/10)*10, by = 10)
+    )
+  ) +
+  
+  scale_x_date(date_breaks = "3 months", date_labels = "%b\n%Y",
+               limits = c(as.Date("2018-01-01"), max(dat2_a$MONTH, na.rm = TRUE)),
+               expand = c(0, 0)) +
+  
+  labs(
+    title = "U.S. Monthly Imports: Coffee (HS0901) and CPI Index of Coffee (CUSR0000SEFP01)",
+    subtitle = paste0(format(as.Date("2018-01-01"), "%b %Y"),
+                      " → ",
+                      format(max(dat2_a$MONTH, na.rm = TRUE), "%b %Y")),
+    x = "Month and Year"
+  ) +
+  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+coffee
+
+
+
+
+# Save plot
+ggsave("coffee_tariff_plot.png", p, width = 12, height = 6, dpi = 300)
+print(coffee)
+
+
+
+
+```
